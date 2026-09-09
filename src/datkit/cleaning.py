@@ -55,11 +55,8 @@ def missing_count(s: pd.Series) -> int:
     return int(missing.fillna(True).sum())
 
 
-
-
 def remove_whitespace(s: pd.Series) -> pd.Series:
     """Remove leading and trailing whitespace from string columns in the series."""
-
     # use is_string_dtype to also include apache arrow data types
     if pd.api.types.is_string_dtype(s.dtype):
         s = s.str.strip()

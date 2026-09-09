@@ -40,6 +40,7 @@ a wheel is a zip and `zipimport` is in the standard library:
 
 ```python
 import sys
+
 sys.path.insert(0, "datkit-0.1.0-py3-none-any.whl")
 import datkit
 ```
