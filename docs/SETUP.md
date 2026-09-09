@@ -838,9 +838,9 @@ Roughly 5-10x smaller, and `.str` operations run inside Arrow rather than
 through the object path.
 
 ```python
-dtype="string[pyarrow]"     # Arrow-backed
-dtype="string"              # pandas StringDtype, python-backed
-dtype=str                   # object — `str` is the Python type, not a pandas dtype
+dtype = "string[pyarrow]"  # Arrow-backed
+dtype = "string"  # pandas StringDtype, python-backed
+dtype = str  # object — `str` is the Python type, not a pandas dtype
 ```
 
 **pyarrow as a dev dependency, not a runtime one.** It is a large compiled
@@ -850,10 +850,76 @@ environment. Detect it at runtime and fall back:
 ```python
 try:
     import pyarrow  # noqa: F401
+
     dtype = "string[pyarrow]"
 except ImportError:
     dtype = "string"
 ```
+
+### Arrow and numpy disagree about NaN — the sharpest gotcha found so far
+
+Under numpy, NaN **is** missing: both `isna()` and `count()` treat it that way.
+Under Arrow, NaN is a **valid double distinct from null**, so `isna()` returns
+False for it and `count()` counts it as present.
+
+```
+Arrow double[pyarrow] holding [nan, nan, <NA>]
+
+  isna()   → [False, False, True]     count() → 2
+  s != s   → [True,  True,  <NA>]
+```
+
+**Consequence:** a guard written as `len(s) - s.count()` silently fails under
+Arrow. A failed numeric coercion produces NaN, Arrow reports no new nulls, the
+guard concludes nothing was lost — and every text column in the frame is
+returned as an all-NaN double. The byte counts even look *better*, because
+8 bytes of NaN per row is smaller than the text it replaced.
+
+Swapping `count()` for `isna()` does not help — they are two sides of the same
+question, and Arrow's answer for NaN is the same either way. The portable form
+adds a NaN test:
+
+```python
+def missing_count(s: pd.Series) -> int:
+    """Count values that are null or NaN."""
+    missing = s.isna()
+    if pd.api.types.is_float_dtype(s.dtype):
+        # NaN is the one value not equal to itself (IEEE 754), so this is True
+        # exactly where NaN sits — including the NaNs Arrow calls present.
+        missing = missing | (s != s)
+    # At a genuine null, `s != s` gives <NA>; a null is missing, so fill True.
+    return int(missing.fillna(True).sum())
+```
+
+Use it everywhere a null count feeds a decision.
+
+### Other backend differences
+
+- **Dtype checks must not compare to literal names.** `s.dtype in ["object",
+  "string"]` is False for `ArrowDtype`, whose name is `"string[pyarrow]"`, so
+  every function silently falls through and does nothing. Use
+  `pd.api.types.is_string_dtype`, `is_numeric_dtype`, `is_datetime64_any_dtype`.
+- `pd.api.types.is_category_dtype` **was removed in pandas 3**. Use
+  `isinstance(s.dtype, pd.CategoricalDtype)`.
+- `.str` coverage is incomplete on `ArrowDtype` — some methods raise
+  `NotImplementedError`.
+- scikit-learn, scipy and matplotlib expect numpy arrays; Arrow columns often
+  need `.to_numpy()` first, and a nullable integer with nulls cannot become a
+  plain numpy int at all.
+- **Test against every backend.** A `text_dtype` fixture in `tests/conftest.py`
+  parametrised over `object`, `string` and `ArrowDtype(string)` runs each test
+  three times. Since the target environment's backend is not under our control,
+  this is the only way to find these differences here rather than there.
+
+### Conversion is not always a memory win
+
+A sparse column can grow when converted. A mostly-null short string costs almost
+nothing in Arrow; a null `int64` still occupies its 8 bytes. Converting a 96%
+null year column from text to `int64` cost 204 KB on 100k rows.
+
+Also expect a small consistent *loss* on columns that were masked but not
+converted: Arrow allocates a **validity bitmap** of one bit per row the first
+time a column can hold nulls — 12,500 bytes per 100k rows.
 
 ### Reading
 
@@ -861,10 +927,10 @@ except ImportError:
 pd.read_csv(
     path,
     sep="\t",
-    usecols=[...],           # biggest win — do not load what you do not need
-    nrows=100_000,           # while developing
-    dtype=str,               # no inference; cleaning decides the types
-    keep_default_na=False,   # stop pandas nulling "NA" before you see it
+    usecols=[...],  # biggest win — do not load what you do not need
+    nrows=100_000,  # while developing
+    dtype=str,  # no inference; cleaning decides the types
+    keep_default_na=False,  # stop pandas nulling "NA" before you see it
 )
 ```
 
@@ -972,6 +1038,50 @@ degrades rather than breaking the import.
 - After a **squash** merge, `git branch -d` may refuse because the squash created
   a new commit with no visible lineage. `git branch -D` is safe once the work is
   on main.
+
+### Before making a repo public: the commit email
+
+Every commit stores an author email, and it is visible on a public repo. Check
+what is actually in the history, not just the working tree:
+
+```powershell
+git log --format="%an <%ae>" | Sort-Object -Unique
+```
+
+Set the identity so it cannot happen again — GitHub → Settings → Emails →
+*Keep my email addresses private* gives an address of the form
+`<id>+<username>@users.noreply.github.com`, which still links commits to the
+account:
+
+```powershell
+git config --global user.email "<id>+<username>@users.noreply.github.com"
+```
+
+Tick **Block command line pushes that expose my email** on the same page.
+
+**A force-push does not remove the old commits.** GitHub keeps pull-request refs
+(`refs/pull/N/head`) pointing at the original commits, so anything that was ever
+in a PR stays reachable by SHA even after the branch is rewritten. Rewriting
+history with `git filter-repo` has the same limitation.
+
+The only clean fix is to **delete the repository** and push a fresh history. For
+a young repo with few commits that is also the simpler path — no history-rewrite
+tooling, nothing irreversible to get wrong beyond the deletion itself:
+
+```powershell
+Remove-Item -Recurse -Force .git
+git init ; git add -A ; git commit -m "Initial commit"
+git log --format="%an <%ae>"        # verify BEFORE pushing
+gh repo delete <owner>/<repo> --yes
+gh repo create <repo> --private --source=. --remote=origin --push
+```
+
+`gh repo delete` needs a scope the default login does not have —
+`gh auth refresh -h github.com -s delete_repo`, or delete via the web UI under
+Settings → Danger Zone.
+
+Note that branch protection rules live on the repository, so they are lost with
+it and need re-adding.
 
 ---
 
