@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Development data — downloaded, never committed. Large, and
+# licensed for local use only.
+/devdata/
+
+# Package distribution files
+/dist/

@@ -1,0 +1,38 @@
+[project]
+name = "datkit"
+version = "0.1.0"
+description = "Toolkit to speed up specific exploratory data analysis tasks"
+readme = "README.md"
+authors = [
+    { name = "Paul de Beer" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "pydantic>=2",
+    "pyyaml>=6",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "pyarrow>=25.0.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "N", "D"]
+ignore = ["D401", "SIM108"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
