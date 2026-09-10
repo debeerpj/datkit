@@ -1,5 +1,7 @@
 """Helper functions for cleaning columns in a DataFrame."""
 
+import re
+
 import pandas as pd
 
 """Still need to add special treatment for category type fields -
@@ -104,34 +106,78 @@ def uppercase(s: pd.Series) -> pd.Series:
         return s
 
 
+def _guess_format(v: str, dayfirst: bool) -> str | None:
+    """Guess a strftime format, retrying with month names title-cased.
+
+    The guesser matches calendar.month_abbr literally ('Mar'), so 'mar' and
+    'MAR' return None even though to_datetime parses them happily.
+    """
+    fmt = pd.tseries.api.guess_datetime_format(v, dayfirst=dayfirst)
+    if fmt is None:
+        # Title-case alphabetic runs of 3+ letters only, leaving AM/PM alone.
+        fmt = pd.tseries.api.guess_datetime_format(
+            re.sub(r"[A-Za-z]{3,}", lambda m: m.group(0).title(), v), dayfirst=dayfirst
+        )
+    return fmt
+
+
 def clean_dates(s: pd.Series) -> pd.Series:
     """Clean date columns in the series."""
     # always cater for US and non-US date formats by trying both dayfirst True and False
 
     if pd.api.types.is_string_dtype(s.dtype):
-        # take a sample to test if the column can be converted to datetime
-        non_null = s.dropna()
-        if len(non_null) > 10:
-            dt = non_null.sample(n=10, random_state=1)
+        non_null = (
+            s.dropna()
+        )  # dropna() retains original index, so if first item was null non_null[0] will give an error
+
+        # if all null column return original
+        if len(non_null) == 0:
+            return s
+
+        # test if first value can be converted to datetime, if not return the original series
+        dateformat_dayfirsttrue = _guess_format(non_null.iloc[0], dayfirst=True)
+        dateformat_dayfirstfalse = _guess_format(non_null.iloc[0], dayfirst=False)
+        if dateformat_dayfirsttrue is None and dateformat_dayfirstfalse is None:
+            return s
+
+        # take a sample to determine if date format is consistent
+        # and if dayfirst=True or dayfirst=False as a lot of dates will work with both and give incorrect results
+        if len(non_null) > 100:
+            dt = non_null.sample(n=100, random_state=1)
         else:
             dt = non_null
 
-        sample_dt_dayftrue = pd.to_datetime(dt, dayfirst=True, errors="coerce")
-        sample_dt_dayffalse = pd.to_datetime(dt, dayfirst=False, errors="coerce")
+        dateformat_dayfirsttrue = dt.map(lambda v: _guess_format(v, dayfirst=True), na_action="ignore")
+        dateformat_dayfirstfalse = dt.map(lambda v: _guess_format(v, dayfirst=False), na_action="ignore")
 
-        # if any of the sample items cannot be converted to datetime, return the original series
-        if (sample_dt_dayftrue.isna() & sample_dt_dayffalse.isna()).any():
+        # if some non-null values can't be converted by either then return the original
+        # or if multiple potential formats are found then return the original
+
+        nonnull_count_dayfirsttrue = len(dateformat_dayfirsttrue.dropna())
+        nonnull_count_dayfirstfalse = len(dateformat_dayfirstfalse.dropna())
+        unique_count_dayfirsttrue = len(dateformat_dayfirsttrue.dropna().unique())
+        unique_count_dayfirstfalse = len(dateformat_dayfirstfalse.dropna().unique())
+
+        if nonnull_count_dayfirsttrue < len(dt) and nonnull_count_dayfirstfalse < len(dt):
+            return s
+        elif (
+            nonnull_count_dayfirsttrue == len(dt)
+            and unique_count_dayfirsttrue == 1
+            and dateformat_dayfirsttrue.dropna().unique()[0][0:2] == "%Y"
+        ):
+            # dayfirst=true break dates starting with year
+            formatted_dates = pd.to_datetime(s, format=dateformat_dayfirstfalse.dropna().unique()[0], errors="coerce")
+        elif nonnull_count_dayfirsttrue == len(dt) and unique_count_dayfirsttrue == 1:
+            formatted_dates = pd.to_datetime(s, format=dateformat_dayfirsttrue.dropna().unique()[0], errors="coerce")
+        elif nonnull_count_dayfirstfalse == len(dt) and unique_count_dayfirstfalse == 1:
+            formatted_dates = pd.to_datetime(s, format=dateformat_dayfirstfalse.dropna().unique()[0], errors="coerce")
+        else:
             return s
 
-        dt_dayftrue = pd.to_datetime(s, dayfirst=True, errors="coerce")
-        dt_dayffalse = pd.to_datetime(s, dayfirst=False, errors="coerce")
-
-        # if there are more nulls in the both cleaned series than the original,
+        # if there are more nulls in the cleaned series than the original,
         # then it might not be a date column
-        if missing_count(s) == missing_count(dt_dayftrue):
-            return dt_dayftrue
-        elif missing_count(s) == missing_count(dt_dayffalse):
-            return dt_dayffalse  # return the original series if cleaning results in more nulls
+        if missing_count(s) == missing_count(formatted_dates):
+            return formatted_dates
         else:
             return s
 
