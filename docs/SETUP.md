@@ -996,6 +996,161 @@ counts inline, so diffs are unreadable and the repo grows. Either add
 
 ---
 
+## Step 13a — Rewriting `clean_dates` around a guessed format
+
+The original `clean_dates` parsed the whole column twice — once with
+`dayfirst=True`, once with `False` — and kept whichever produced no new nulls.
+Two problems, both visible as a `UserWarning`:
+
+```
+UserWarning: Could not infer format, so each element will be parsed
+individually, falling back to `dateutil`.
+```
+
+That warning means pandas found no single format across the values and is
+parsing **row by row through dateutil** — roughly an order of magnitude slower
+than a vectorised parse, and on 90M rows the difference between a query and a
+coffee break. Parsing the full column twice doubled it again.
+
+The rewrite: guess the format from a sample, check the sample agrees, then parse
+the full column **once** with `format=`.
+
+```python
+from pandas.tseries.api import guess_datetime_format
+```
+
+`guess_datetime_format(dt_str: str, dayfirst=False) -> str | None`. One string
+at a time, so `.map()` it over the sample — which is what you want anyway, since
+agreement across the sample is the signal.
+
+```python
+formats = dt.map(lambda v: _guess_format(v, dayfirst=True), na_action="ignore")
+```
+
+`na_action="ignore"` matters: the function raises `TypeError` on `None` rather
+than returning `None`. `.value_counts()` on the result is more useful than
+`.unique()` — it says which format dominates when they disagree, which is what a
+future tolerance parameter will need.
+
+### `dayfirst=True` silently corrupts ISO dates
+
+The sharpest gotcha in this step.
+
+```python
+guess_datetime_format("2025-01-03", dayfirst=True)   # '%Y-%d-%m'
+guess_datetime_format("2025-01-03", dayfirst=False)  # '%Y-%m-%d'
+```
+
+The day-first preference is applied even to an unambiguous year-first string.
+The docstring admits it — "dayfirst=True is not strict … (this is a known bug)".
+Parsing with the returned `%Y-%d-%m` turns 3 January into 1 March. **Nothing
+fails**: no exception, no NaT, so the `missing_count` guard cannot catch it. The
+column is simply wrong.
+
+`dayfirst` is meaningless once a format starts with `%Y`, so that case must not
+consult the day-first guess at all:
+
+```python
+if fmt_dayfirst_true[:2] == "%Y":
+    fmt = fmt_dayfirst_false
+```
+
+pandas emits its own warning when this happens — *"Parsing dates in `%Y-%m-%d`
+format when `dayfirst=True` was specified"* — a different message from the one
+above, and worth reading rather than suppressing.
+
+### Which way should ambiguity resolve?
+
+`03/04/2025` parses under both. Day-first is the convention across the UK,
+Europe, Australia, South Africa, most of Asia and Latin America; month-first is
+essentially US-only. Both this machine and the client's data are day-first, so
+**prefer day-first** for genuinely ambiguous columns.
+
+Note that a real `date`/`datetime` column in SQL Server arrives as a datetime
+and never reaches `clean_dates`. What arrives as text is exports, CSVs and
+free-text columns — and SQL Server's own string conversion depends on the
+connection's language setting.
+
+### The guesser is case-sensitive, the parser is not
+
+```python
+guess_datetime_format("12 Mar 2024")   # '%d %b %Y'
+guess_datetime_format("12 mar 2024")   # None
+guess_datetime_format("12 MAR 2024")   # None
+pd.to_datetime(["12 mar 2024"], format="%d %b %Y")   # parses fine
+```
+
+It matches `calendar.month_abbr` / `month_name` literally, and those are
+capitalised-first. So the guess is **stricter than the parse**, and a column the
+old dateutil path handled is now rejected outright.
+
+`_guess_format` normalises for the guess only, leaving the column untouched:
+
+```python
+fmt = pd.tseries.api.guess_datetime_format(v, dayfirst=dayfirst)
+if fmt is None:
+    fmt = pd.tseries.api.guess_datetime_format(
+        re.sub(r"[A-Za-z]{3,}", lambda m: m.group(0).title(), v), dayfirst=dayfirst
+    )
+```
+
+Two deliberate choices:
+
+- **Raw guess first, normalised only as a fallback.** Values that already work
+  behave exactly as before, so the change cannot regress them. It also protects
+  `'2024-03-12 10:30:00 UTC'`, which guesses `%Z` untouched but would become
+  `Utc` if normalised.
+- **3+ letters only.** `.upper()` is not an option — `'12 MAR 2024'` guesses
+  `None`, so uppercasing would reject every month-name column.
+
+### AM/PM deliberately unsupported
+
+Only fully-uppercase `AM`/`PM` is recognised as `%p`:
+
+```
+'2024-03-12 10:30AM'  ->  '%Y-%m-%d %I:%M%p'
+'2024-03-12 10:30am'  ->  '%Y-%m-%d %H:%Mam'    'am' as literal text, 24-hour
+'2024-03-12 10:30 PM' ->  None                  a space defeats it entirely
+```
+
+The `%H:%Mam` case is the dangerous one — a PM time parses as AM, silently.
+Uppercasing meridiem could be added (note `\b[ap]m\b` does **not** match
+`10:30am`, since `0` and `a` are both word characters — needs a lookbehind), but
+it was left out: SQL Server renders 24-hour, the library's own support is
+inconsistent, and it is what creates the `UTC` → `Utc` collision above. Known
+gap, documented rather than half-implemented.
+
+### Smaller traps in the same rewrite
+
+- **`dropna()` keeps the original index.** `non_null[0]` is a *label* lookup, so
+  a column whose first row is null raises `KeyError: 0`. Use `.iloc[0]`, and
+  guard the all-null case before it.
+- **Do not compare counts to a literal sample size.** `len(dropna()) == 100`
+  is only ever true for columns with more than 100 non-null values; every
+  smaller column silently fell through and returned unchanged. Compare to
+  `len(dt)`. This is why the test suite failed while a manual check on devdata
+  passed.
+- **Compute `.unique()[0]` inside the branch that uses it**, not up front — an
+  empty array raises `IndexError`, and the sample need not contain the one value
+  the first-value check approved.
+
+### Reading a warning's line number
+
+Twice now a `UserWarning` has pointed at a line that cannot produce it — the
+quoted source was a comment, and the message was a `to_datetime` message
+attributed to a `guess_datetime_format` call.
+
+Python stores the *line number* from the frame that warned, then renders the
+source by reading the file **as it is on disk now**. After an edit, an old
+module still resident in the kernel reports stale offsets against new text.
+
+So: **if the quoted source line cannot plausibly emit the message, the kernel is
+stale.** Restart it. `pytest` imports fresh each run and is the honest check.
+Restarting also releases the memory those stale module objects and cell outputs
+are holding — on 16 GB with devdata loaded, that is not a small amount.
+
+---
+
 ## Progress output: logging, not print
 
 `print` in a library cannot be turned off, always goes to stdout, and pollutes
