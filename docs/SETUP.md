@@ -1037,7 +1037,7 @@ future tolerance parameter will need.
 The sharpest gotcha in this step.
 
 ```python
-guess_datetime_format("2025-01-03", dayfirst=True)   # '%Y-%d-%m'
+guess_datetime_format("2025-01-03", dayfirst=True)  # '%Y-%d-%m'
 guess_datetime_format("2025-01-03", dayfirst=False)  # '%Y-%m-%d'
 ```
 
@@ -1074,10 +1074,10 @@ connection's language setting.
 ### The guesser is case-sensitive, the parser is not
 
 ```python
-guess_datetime_format("12 Mar 2024")   # '%d %b %Y'
-guess_datetime_format("12 mar 2024")   # None
-guess_datetime_format("12 MAR 2024")   # None
-pd.to_datetime(["12 mar 2024"], format="%d %b %Y")   # parses fine
+guess_datetime_format("12 Mar 2024")  # '%d %b %Y'
+guess_datetime_format("12 mar 2024")  # None
+guess_datetime_format("12 MAR 2024")  # None
+pd.to_datetime(["12 mar 2024"], format="%d %b %Y")  # parses fine
 ```
 
 It matches `calendar.month_abbr` / `month_name` literally, and those are
