@@ -1,7 +1,5 @@
 """Memory probe that works inside a capped container. Standard library only."""
 
-import os
-
 # A cgroup with no cap set reports a sentinel near 2**63, not a missing file.
 # Anything above this is "unlimited", so fall back to the host's total.
 _NO_LIMIT = 2**62
@@ -65,14 +63,12 @@ def memory_status():
     limit = _read_first(_LIMIT_FILES)
     if limit is not None:
         used = _read_first(_USAGE_FILES) or 0
-        return {"limit_bytes": limit, "used_bytes": used,
-                "available_bytes": limit - used, "source": "cgroup"}
+        return {"limit_bytes": limit, "used_bytes": used, "available_bytes": limit - used, "source": "cgroup"}
 
     total = _host_total()
     avail = _host_available()
     used = total - avail if total and avail else None
-    return {"limit_bytes": total, "used_bytes": used,
-            "available_bytes": avail, "source": "host"}
+    return {"limit_bytes": total, "used_bytes": used, "available_bytes": avail, "source": "host"}
 
 
 def peak_rss_bytes():
@@ -83,6 +79,7 @@ def peak_rss_bytes():
         return None
     # ru_maxrss is kB on Linux, bytes on macOS.
     import sys
+
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak if sys.platform == "darwin" else peak * 1024
 
