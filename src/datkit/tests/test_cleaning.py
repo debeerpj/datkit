@@ -4,10 +4,20 @@ import pandas as pd
 from pandas.testing import assert_series_equal
 
 from datkit.cleaning import (
+    MAX_SPECIALS,
+    _guess_format,
+    _is_text,
+    _to_datetime,
+    _to_numeric,
     clean_column,
+    clean_column_dtype,
     clean_dataframe,
     clean_dates,
     clean_numbers,
+    column_record,
+    discover_specials,
+    effective_dtype,
+    failed_values,
     missing_count,
     remove_whitespace,
     sample_records,
@@ -518,6 +528,13 @@ def test_record_is_a_dataframe_with_the_expected_columns():
         "dtype_before",
         "dtype_after",
         "converted",
+        # The sentinel verdict: what the column would be without the values
+        # listed in `specials`. Only reproducible alongside them, so the two
+        # are recorded together.
+        "dtype_effective",
+        "specials",
+        "specials_count",
+        "n_unique",
         "bytes_before",
         "bytes_after",
         "bytes_saved",
@@ -645,3 +662,379 @@ def test_clean_dataframe_reports_no_false_losses(text_dtype):
 
     # Nothing was lost anywhere.
     assert (record["nulls_created"] == 0).all()
+
+
+# --- _is_text -------------------------------------------------------------
+#
+# The guard everything else is gated on, so it gets the most direct tests.
+#
+# The failure it exists to catch: is_string_dtype is True for ANY object
+# column, and object is still the default for text on pandas 2.2.3 — the
+# target version. That let an object column of ints reach .str, and an object
+# column of mixed types lose its non-string values to coercion. Neither shows
+# up on pandas 3 locally, where text arrives as the `str` dtype.
+
+
+def test_is_text_accepts_strings_in_every_backend(text_dtype):
+    """Real text is text whatever the string backend."""
+    assert _is_text(pd.Series(["a", "b", None], dtype=text_dtype))
+
+
+def test_is_text_rejects_object_columns_that_are_not_text():
+    """The shapes is_string_dtype gets wrong. Each is True there, False here."""
+    not_text = {
+        "ints": pd.Series([1, 2, 3], dtype=object),
+        "mixed": pd.Series([1, "a", None], dtype=object),
+        "bools": pd.Series([True, False], dtype=object),
+        "all null": pd.Series([None, None], dtype=object),
+        "empty": pd.Series([], dtype=object),
+    }
+    for label, s in not_text.items():
+        # is_string_dtype says True for all of these — that is the bug.
+        assert pd.api.types.is_string_dtype(s.dtype), f"{label}: premise changed"
+        assert not _is_text(s), f"{label}: should not be treated as text"
+
+
+def test_is_text_rejects_non_object_dtypes():
+    """Numbers, dates and categories are not text."""
+    assert not _is_text(pd.Series([1, 2]))
+    assert not _is_text(pd.Series([1.5, 2.5]))
+    assert not _is_text(pd.to_datetime(pd.Series(["2020-01-01"])))
+    assert not _is_text(pd.Series(["a", "b"], dtype="category"))
+
+
+def test_is_text_ignores_nulls_when_judging():
+    """A column of strings is still text with nulls scattered through it."""
+    assert _is_text(pd.Series([None, "a", None, "b"], dtype=object))
+
+
+# --- _guess_format --------------------------------------------------------
+
+
+def test_guess_format_reads_an_ordinary_date():
+    """A plain ISO date gives back its format string."""
+    assert _guess_format("2020-03-15", dayfirst=False) == "%Y-%m-%d"
+
+
+def test_guess_format_retries_lowercase_month_names():
+    """The guesser matches month names literally; to_datetime does not.
+
+    'Mar' is in calendar.month_abbr, 'mar' and 'MAR' are not, so the raw
+    guesser returns None for them even though the dates parse fine. The retry
+    title-cases alphabetic runs so all three spellings agree.
+    """
+    titled = _guess_format("15-Mar-2020", dayfirst=True)
+    assert titled is not None
+    assert _guess_format("15-mar-2020", dayfirst=True) == titled
+    assert _guess_format("15-MAR-2020", dayfirst=True) == titled
+
+
+def test_guess_format_returns_none_for_non_dates():
+    """Text that is not a date has no format."""
+    assert _guess_format("not a date", dayfirst=False) is None
+
+
+def test_guess_format_dayfirst_misreads_ambiguous_iso_dates():
+    """Documents the trap clean_dates works around.
+
+    With dayfirst=True an ISO string whose last field could be a month comes
+    back as %Y-%d-%m — year, then DAY, then month. Parsing a column with that
+    silently transposes every date in it. clean_dates checks for a %Y prefix
+    and switches to the dayfirst=False format because of this.
+
+    Only ambiguous dates are affected, which is what makes it dangerous: a
+    sample of dates with days above 12 guesses correctly and the column looks
+    fine until a date like 2020-01-02 arrives.
+    """
+    # Last field is 02 — could be February, so dayfirst reorders it.
+    assert _guess_format("2020-01-02", dayfirst=True) == "%Y-%d-%m"
+
+    # Last field is 15 — cannot be a month, so it is read correctly.
+    assert _guess_format("2020-03-15", dayfirst=True) == "%Y-%m-%d"
+
+
+# --- _to_numeric / _to_datetime -------------------------------------------
+# Thin wrappers over the raw pandas coercions. They exist so discover_specials
+# can see what fails: clean_numbers and clean_dates refuse and hand back the
+# original, which discards exactly the evidence being recovered.
+
+
+def test_to_numeric_nulls_what_will_not_convert():
+    """Unconvertible values become null rather than raising."""
+    result = _to_numeric(pd.Series(["1", "2", "unknown"]))
+    assert result.tolist()[:2] == [1, 2]
+    assert pd.isna(result.tolist()[2])
+
+
+def test_to_datetime_nulls_what_will_not_convert():
+    """Same contract for dates."""
+    result = _to_datetime(pd.Series(["2020-01-01", "not collected"]))
+    assert result.tolist()[0] == pd.Timestamp("2020-01-01")
+    assert pd.isna(result.tolist()[1])
+
+
+def test_to_numeric_differs_from_clean_numbers_on_refusal():
+    """The wrapper coerces where clean_numbers refuses. That is the point."""
+    raw = pd.Series(["1", "2", "unknown"])
+
+    # clean_numbers protects the data: one loss and the column comes back as-is.
+    assert_series_equal(clean_numbers(raw), raw)
+
+    # _to_numeric does not protect it, so the failures are visible.
+    assert _to_numeric(raw).isna().sum() == 1
+
+
+# --- failed_values --------------------------------------------------------
+
+
+def test_failed_values_reports_what_the_coercion_lost():
+    """The distinct original values that became null."""
+    raw = pd.Series(["1", "2", "unknown", "3", "REFUSED", "unknown"])
+    assert sorted(failed_values(raw, _to_numeric(raw))) == ["REFUSED", "unknown"]
+
+
+def test_failed_values_is_empty_when_nothing_failed():
+    """A clean conversion has no offenders."""
+    raw = pd.Series(["1", "2", "3"])
+    assert failed_values(raw, _to_numeric(raw)) == []
+
+
+def test_failed_values_ignores_values_that_were_already_null():
+    """A pre-existing null was not lost by the coercion, so it is not blamed."""
+    raw = pd.Series(["1", None, "unknown"])
+    assert failed_values(raw, _to_numeric(raw)) == ["unknown"]
+
+
+def test_failed_values_honours_the_limit():
+    """Collection stops at the limit rather than building an unbounded list."""
+    raw = pd.Series([f"bad_{i}" for i in range(100)])
+    assert len(failed_values(raw, _to_numeric(raw), limit=5)) == 5
+
+
+def test_failed_values_default_limit_exceeds_the_cap_by_one():
+    """One over MAX_SPECIALS, so a caller can tell 'at the cap' from 'over it'."""
+    raw = pd.Series([f"bad_{i}" for i in range(100)])
+    assert len(failed_values(raw, _to_numeric(raw))) == MAX_SPECIALS + 1
+
+
+# --- discover_specials ----------------------------------------------------
+
+
+def test_discover_specials_finds_the_blocking_values():
+    """A numeric column held back by two tokens proposes exactly those two."""
+    s = pd.Series(["1", "2", "unknown", "4", "REFUSED", "6"], dtype=object)
+    assert sorted(discover_specials(s)) == ["REFUSED", "unknown"]
+
+
+def test_discover_specials_finds_date_sentinels():
+    """Falls through to the date coercion when the numeric one does not fit."""
+    s = pd.Series(["2020-01-01", "2020-02-01", "not collected", "2020-04-01"], dtype=object)
+    assert discover_specials(s) == ["not collected"]
+
+
+def test_discover_specials_rejects_a_column_of_names():
+    """The ratio guard rejects a column whose values are all unconvertible.
+
+    Six names are six unconvertible values — under the cap of ten, so without
+    the ratio test every one of them would be proposed as a sentinel.
+    """
+    s = pd.Series(["ann", "bob", "cy", "di", "ed", "fi"], dtype=object)
+    assert discover_specials(s) == []
+
+
+def test_discover_specials_rejects_too_many_distinct_failures():
+    """The absolute cap. Scattered unconvertible values are not sentinels."""
+    # 20 distinct failures among 200 values: ratio passes, cap does not.
+    values = [str(i) for i in range(180)] + [f"bad_{i}" for i in range(20)]
+    assert discover_specials(pd.Series(values, dtype=object)) == []
+
+
+def test_discover_specials_returns_nothing_for_a_clean_column():
+    """Nothing is blocking the conversion, so there is nothing to propose."""
+    assert discover_specials(pd.Series(["1", "2", "3"], dtype=object)) == []
+
+
+def test_discover_specials_skips_non_text_columns():
+    """An object column of ints is not text.
+
+    Before the gate this reached .str inside remove_whitespace and raised
+    AttributeError, because is_string_dtype is True for any object column.
+    """
+    assert discover_specials(pd.Series([1, 2, 3], dtype=object)) == []
+    assert discover_specials(pd.Series([1, 2, 3])) == []
+
+
+def test_discover_specials_proposes_but_never_acts():
+    """The column is not modified, and the sentinels are still in it."""
+    s = pd.Series(["1", "2", "unknown"], dtype=object)
+    before = s.tolist()
+    discover_specials(s)
+    assert s.tolist() == before
+
+
+def test_discover_specials_is_reproducible():
+    """The same seed proposes the same candidates."""
+    values = [str(i) for i in range(500)] + ["unknown"] * 20
+    s = pd.Series(values, dtype=object)
+    assert discover_specials(s, sample_n=100, seed=3) == discover_specials(s, sample_n=100, seed=3)
+
+
+def test_discover_specials_ignores_whitespace_and_null_tokens():
+    """Discovery sees what the coercions would see, not the raw column.
+
+    The candidates are found after remove_whitespace and to_null, so a padded
+    "N/A" is already a null by then and is not proposed as a sentinel.
+    """
+    s = pd.Series([" 1", "2 ", " N/A ", "4", "unknown"], dtype=object)
+    assert discover_specials(s) == ["unknown"]
+
+
+# --- effective_dtype ------------------------------------------------------
+
+
+def test_effective_dtype_reports_what_the_column_would_be():
+    """With the sentinels set aside, the column is numeric."""
+    s = pd.Series(["1", "2", "unknown", "4"], dtype=object)
+    assert effective_dtype(s, ["unknown"]) == "int64"
+
+
+def test_effective_dtype_with_no_specials_is_the_ordinary_dtype():
+    """An empty list makes this the dtype clean_column would produce."""
+    s = pd.Series(["1", "2", "3"], dtype=object)
+    assert effective_dtype(s, []) == str(clean_column(s).dtype)
+
+
+def test_effective_dtype_leaves_the_column_alone():
+    """A claim about the column, not a change to it."""
+    s = pd.Series(["1", "2", "unknown"], dtype=object)
+    before = s.tolist()
+    effective_dtype(s, ["unknown"])
+    assert s.tolist() == before
+
+
+def test_effective_dtype_when_everything_is_excluded():
+    """Excluding every value leaves nothing to infer from, so the dtype stands."""
+    s = pd.Series(["unknown", "unknown"], dtype=object)
+    assert effective_dtype(s, ["unknown"]) == str(s.dtype)
+
+
+def test_effective_dtype_drops_rather_than_nulls():
+    """Sentinels are removed, not nulled.
+
+    Nulling them would register as a failed coercion inside clean_numbers,
+    which would then refuse the column — leaving the effective dtype equal to
+    the original and the whole exercise pointless.
+    """
+    s = pd.Series(["1", "2", "unknown", "4"], dtype=object)
+    assert effective_dtype(s, ["unknown"]) != str(s.dtype)
+
+
+# --- clean_column_dtype ---------------------------------------------------
+
+
+def test_clean_column_dtype_matches_clean_column():
+    """The probe agrees with the thing it is probing."""
+    for values in (["1", "2", "3"], ["2020-01-01", "2020-02-01"], ["a", "b"]):
+        s = pd.Series(values, dtype=object)
+        assert clean_column_dtype(s) == clean_column(s).dtype
+
+
+def test_clean_column_dtype_does_not_return_the_cleaned_column():
+    """It reports a dtype, so it cannot be mistaken for the cleaner."""
+    assert not isinstance(clean_column_dtype(pd.Series(["1", "2"])), pd.Series)
+
+
+def test_clean_column_dtype_skips_non_text_columns():
+    """Same gate as clean_column. This raised AttributeError before the fix."""
+    s = pd.Series([1, 2, 3], dtype=object)
+    assert clean_column_dtype(s) == s.dtype
+
+
+# --- column_record --------------------------------------------------------
+# Split out of clean_dataframe so the record's shape can be tested without
+# cleaning a frame to get one.
+
+
+def make_record(values=("1", "2", "unknown", "4"), specials=("unknown",)):
+    """Build one record row from a column and its sentinels."""
+    before = pd.Series(list(values), dtype=object)
+    after = clean_column(before)
+    return column_record(
+        name="votes",
+        before=before,
+        after=after,
+        specials=list(specials),
+        dtype_effective=effective_dtype(before, list(specials)),
+        n_unique=int(before.nunique()),
+    )
+
+
+def test_column_record_has_the_expected_fields():
+    """The row's shape is the contract clean_dataframe builds its frame from."""
+    assert set(make_record()) == {
+        "column",
+        "dtype_before",
+        "dtype_after",
+        "converted",
+        "dtype_effective",
+        "specials",
+        "specials_count",
+        "n_unique",
+        "bytes_before",
+        "bytes_after",
+        "bytes_saved",
+        "mb_before",
+        "mb_after",
+        "mb_saved",
+        "nulls_before",
+        "nulls_after",
+        "nulls_created",
+    }
+
+
+def test_column_record_counts_the_sentinel_rows():
+    """specials_count is rows, not distinct values."""
+    record = make_record(values=("1", "unknown", "unknown", "4"))
+    assert record["specials_count"] == 2
+
+
+def test_column_record_counts_no_sentinels_when_there_are_none():
+    """An empty sentinel list counts zero rows, with no special case.
+
+    isin against an empty list is all False, so the count falls out correctly.
+    """
+    record = make_record(values=("1", "2", "3"), specials=())
+    assert record["specials_count"] == 0
+
+
+def test_column_record_reports_the_effective_dtype_alongside_the_actual():
+    """The two verdicts differ exactly when sentinels are holding a column back."""
+    held_back = make_record(values=("1", "2", "unknown", "4"))
+    assert held_back["dtype_after"] == "object"
+    assert held_back["dtype_effective"] == "int64"
+
+    clean = make_record(values=("1", "2", "3"), specials=())
+    assert clean["dtype_after"] == clean["dtype_effective"]
+
+
+def test_column_record_flags_conversion():
+    """`converted` compares the dtype before and after, nothing else."""
+    assert make_record(values=("1", "2", "3"), specials=())["converted"]
+    assert not make_record(values=("a", "b"), specials=())["converted"]
+
+
+def test_column_record_bytes_saved_is_the_difference():
+    """The derived byte fields agree with the measured ones."""
+    record = make_record(values=("1", "2", "3"), specials=())
+    assert record["bytes_saved"] == record["bytes_before"] - record["bytes_after"]
+    assert record["mb_saved"] == round(record["bytes_saved"] / 1024**2, 2)
+
+
+def test_column_record_nulls_created_is_zero_when_nothing_is_lost():
+    """A conversion that keeps every value reports no new nulls."""
+    assert make_record(values=("1", "2", "3"), specials=())["nulls_created"] == 0
+
+
+def test_column_record_n_unique_is_carried_through():
+    """Recorded so bin_column can skip a cardinality probe of its own."""
+    assert make_record(values=("1", "1", "2"), specials=())["n_unique"] == 2

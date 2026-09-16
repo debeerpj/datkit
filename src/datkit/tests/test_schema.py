@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from datkit.schema import Column, Relationship, Schema, Table, check_schema
+from datkit.schema import Column, Relationship, Schema, Table, check_schema, load_schema_from_yaml
 
 
 def make_column(name: str, type_: str = "varchar") -> Column:
@@ -184,3 +184,109 @@ def test_invalid_cardinality_is_rejected():
             to_columns=["x"],
             cardinality="sideways",
         )
+
+
+# --- load_schema_from_yaml ------------------------------------------------
+# tmp_path is a pytest built-in fixture: a fresh empty directory per test,
+# cleaned up afterwards. Used here so the suite carries no fixture files —
+# the tests ship inside the wheel and must not depend on anything outside it.
+
+
+def write_yaml(tmp_path, text: str):
+    """Write a schema YAML file and return its path."""
+    path = tmp_path / "schema.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_load_schema_from_yaml_reads_a_valid_file(tmp_path):
+    """A well-formed file becomes a Schema with its tables and columns."""
+    path = write_yaml(
+        tmp_path,
+        """
+        name: imdb
+        tables:
+          - name: title_basics
+            source: title.basics.tsv
+            primary_key: [tconst]
+            columns:
+              - name: tconst
+                type: varchar
+              - name: startYear
+                type: int
+        """,
+    )
+    schema = load_schema_from_yaml(path)
+
+    assert schema.name == "imdb"
+    assert [t.name for t in schema.tables] == ["title_basics"]
+    assert [c.name for c in schema.tables[0].columns] == ["tconst", "startYear"]
+
+
+def test_load_schema_from_yaml_accepts_a_string_path(tmp_path):
+    """The signature allows str as well as Path."""
+    path = write_yaml(tmp_path, "name: imdb\ntables: []\n")
+    assert load_schema_from_yaml(str(path)).name == "imdb"
+
+
+def test_load_schema_from_yaml_applies_column_defaults(tmp_path):
+    """A column with no type recorded comes back as 'unknown', not blank."""
+    path = write_yaml(
+        tmp_path,
+        """
+        name: imdb
+        tables:
+          - name: t
+            source: s
+            columns:
+              - name: c
+        """,
+    )
+    column = load_schema_from_yaml(path).tables[0].columns[0]
+    assert column.type == "unknown"
+    assert column.tags == []
+
+
+def test_load_schema_from_yaml_rejects_an_empty_file(tmp_path):
+    """An empty file is refused at load time, not later.
+
+    safe_load returns None for an empty file, which would fail obscurely
+    downstream. The loader raises a message naming the file instead.
+    """
+    path = write_yaml(tmp_path, "")
+    with pytest.raises(ValueError, match="empty or invalid"):
+        load_schema_from_yaml(path)
+
+
+def test_load_schema_from_yaml_rejects_a_comments_only_file(tmp_path):
+    """Also None from safe_load, and a plausible way to get an empty file."""
+    path = write_yaml(tmp_path, "# nothing here yet\n")
+    with pytest.raises(ValueError, match="empty or invalid"):
+        load_schema_from_yaml(path)
+
+
+def test_load_schema_from_yaml_rejects_a_schema_that_does_not_validate(tmp_path):
+    """Model validation still applies to a file that parses as YAML.
+
+    An empty column name is caught at load time, not at the point the schema
+    is eventually used.
+    """
+    path = write_yaml(
+        tmp_path,
+        """
+        name: imdb
+        tables:
+          - name: t
+            source: s
+            columns:
+              - name: ""
+        """,
+    )
+    with pytest.raises(ValidationError):
+        load_schema_from_yaml(path)
+
+
+def test_load_schema_from_yaml_raises_when_the_file_is_missing(tmp_path):
+    """A missing file surfaces as FileNotFoundError from open()."""
+    with pytest.raises(FileNotFoundError):
+        load_schema_from_yaml(tmp_path / "not_here.yaml")
