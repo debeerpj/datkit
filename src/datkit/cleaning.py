@@ -186,7 +186,33 @@ def clean_dates(s: pd.Series) -> pd.Series:
 
 
 def clean_column(s: pd.Series) -> pd.Series:
-    """Clean a column in the DataFrame."""
+    """Clean a column in the DataFrame.
+
+    Parameters
+    ----------
+    s : pandas.Series
+        Column to clean. Columns that do not hold text are returned untouched.
+
+    Returns
+    -------
+    pandas.Series
+        The cleaned column, or the original if it does not hold text.
+    """
+    # Gate the whole pipeline on the values, not the container.
+    #
+    # is_string_dtype is True for *any* object column, and object is still the
+    # default for text on pandas 2.2.3 — the target version. That let an object
+    # column of ints reach .str (AttributeError), and an object column of mixed
+    # types lose its non-string values to coercion.
+    #
+    # infer_dtype inspects the values, so it tells object-of-strings apart from
+    # object-of-ints. It costs a scan, hence once here rather than inside each
+    # helper. Within the gate the helpers' own is_string_dtype checks are
+    # sufficient, and are what makes clean_dates skip a column clean_numbers
+    # has already converted to numeric.
+    if pd.api.types.infer_dtype(s, skipna=True) != "string":
+        return s
+
     s = remove_whitespace(s)
     s = to_null(s)
     s = clean_numbers(s)
