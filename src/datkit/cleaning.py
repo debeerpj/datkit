@@ -2,6 +2,7 @@
 
 import re
 
+import numpy as np
 import pandas as pd
 
 """Still need to add special treatment for category type fields -
@@ -32,6 +33,43 @@ def sample_records(df: pd.DataFrame, n=10000, seed=1) -> pd.DataFrame:
         return df
 
 
+def missing_mask(s: pd.Series) -> pd.Series:
+    """Boolean mask of values that are null or NaN, on any backend.
+
+    The mask behind missing_count, split out because a caller needing to know
+    WHICH rows are missing must not reach for `s.isna()` instead. Under Arrow
+    a failed coercion produces NaN, which is a valid double distinct from
+    null, so `isna()` reports False for it and the failed rows vanish.
+
+    Parameters
+    ----------
+    s : pandas.Series
+        Any dtype, any backend.
+
+    Returns
+    -------
+    pandas.Series
+        Boolean, True where the value is absent by either definition.
+    """
+    # Catches real nulls: None, NaN under numpy, <NA> under Arrow.
+    missing = s.isna()
+
+    if pd.api.types.is_float_dtype(s.dtype):
+        # Only float columns can hold NaN, so skip this for text and integers.
+        #
+        # NaN is the one value not equal to itself (IEEE 754), so `s != s` is
+        # True exactly where NaN sits — including the NaNs Arrow's isna()
+        # reported as present.
+        #
+        # `|` is element-wise OR on the two boolean Series. Not `or`, which
+        # needs a single truth value and raises on a Series.
+        missing = missing | (s != s)
+
+    # At a genuine null, `s != s` evaluates to <NA> rather than True, which
+    # would propagate into sum(). A null is missing, so fill it with True.
+    return missing.fillna(True).astype(bool)
+
+
 def missing_count(s: pd.Series) -> int:
     """Count values that are null or NaN.
 
@@ -54,23 +92,7 @@ def missing_count(s: pd.Series) -> int:
     int
         Count of values that are absent by either definition.
     """
-    # Catches real nulls: None, NaN under numpy, <NA> under Arrow.
-    missing = s.isna()
-
-    if pd.api.types.is_float_dtype(s.dtype):
-        # Only float columns can hold NaN, so skip this for text and integers.
-        #
-        # NaN is the one value not equal to itself (IEEE 754), so `s != s` is
-        # True exactly where NaN sits — including the NaNs Arrow's isna()
-        # reported as present.
-        #
-        # `|` is element-wise OR on the two boolean Series. Not `or`, which
-        # needs a single truth value and raises on a Series.
-        missing = missing | (s != s)
-
-    # At a genuine null, `s != s` evaluates to <NA> rather than True, which
-    # would propagate into sum(). A null is missing, so fill it with True.
-    return int(missing.fillna(True).sum())
+    return int(missing_mask(s).sum())
 
 
 def remove_whitespace(s: pd.Series) -> pd.Series:
@@ -90,18 +112,43 @@ def to_null(s: pd.Series, tokens=(r"\N", "NA", "N/A", "na", "n/a", "null", "NULL
     return s
 
 
+# Symbols that decorate a number without changing it. Shared so the
+# convertibility check measures the same string clean_numbers would coerce —
+# otherwise "1,234" is reported as unconvertible when it plainly is not.
+NUMERIC_SYMBOLS = ("$", "R", "%", ",")
+
+
+def strip_numeric_symbols(s: pd.Series) -> pd.Series:
+    """Remove currency and grouping symbols from a text column.
+
+    Parameters
+    ----------
+    s : pandas.Series
+        Text column. A non-text column is returned untouched.
+
+    Returns
+    -------
+    pandas.Series
+        The column with each symbol in NUMERIC_SYMBOLS removed.
+    """
+    if not pd.api.types.is_string_dtype(s.dtype):
+        return s
+
+    # Explicit loop: each pass rewrites the column, so this is real work.
+    r = s
+    for char in NUMERIC_SYMBOLS:
+        r = r.str.replace(char, "", regex=False)
+    return r
+
+
 def clean_numbers(s: pd.Series) -> pd.Series:
     """Clean numeric columns in the series."""
-    remove = ["$", "R", "%", ","]
-
     # ordering is important:
     # first check if everything left over will be a number,
     # then start removing characters,
     # then convert to numeric
     if pd.api.types.is_string_dtype(s.dtype):
-        r = s
-        for char in remove:
-            r = r.str.replace(char, "", regex=False)
+        r = strip_numeric_symbols(s)
         r = pd.to_numeric(r, errors="coerce")  # convert to numeric, setting errors to NaN
 
         # if there are more nulls in the cleaned series than the original,
@@ -279,10 +326,13 @@ def failed_values(s: pd.Series, converted: pd.Series, limit: int = MAX_SPECIALS 
     list
         Distinct offending values, at most `limit` of them.
     """
-    # Null after, not null before. Note this uses isna() rather than
-    # missing_count(): we need the mask, not the count, and the Arrow NaN
-    # problem does not arise because the "before" side is text.
-    lost = converted.isna() & s.notna()
+    # Null after, not null before.
+    #
+    # missing_mask, not isna(). The Arrow NaN problem is on the AFTER side:
+    # a failed coercion of an Arrow column produces NaN, which isna() reports
+    # as present, so every failure would be invisible and the column would
+    # look clean.
+    lost = missing_mask(converted) & ~missing_mask(s)
     if not lost.any():
         return []
 
@@ -358,7 +408,7 @@ def discover_specials(
             # Nothing was blocking this coercion, so nothing to propose.
             return []
 
-        failed_distinct = int(prepared[converted.isna() & prepared.notna()].nunique())
+        failed_distinct = int(prepared[missing_mask(converted) & ~missing_mask(prepared)].nunique())
         if len(candidates) <= MAX_SPECIALS and failed_distinct / distinct <= max_ratio:
             return candidates
 
@@ -420,6 +470,452 @@ def clean_column_dtype(s: pd.Series):
     return probe.dtype
 
 
+# Above this share of failures the column is not contaminated — it is text.
+# Reporting every title in primaryTitle as "unconvertible" is true and
+# useless: it buries the column that has 32 bad rows among the columns that
+# were never numbers. Shared by the record and by find_unconvertible so the
+# two views cannot disagree about the same column.
+CONTAMINATION_MAX_PCT = 50.0
+
+# How many distinct offending values to keep as evidence. A bounded list, so
+# the output stays the same size whether the column has 12 bad rows or 12M.
+MAX_UNCONVERTIBLE_VALUES = 20
+
+# Rows to look at when deciding which coercion a column is closest to. That
+# is a majority question — is this mostly numbers or mostly dates — and a
+# sample settles it. Counting the failures is a rare-event question and is
+# not sampled; see convertibility.
+TARGET_SAMPLE = 10_000
+
+# A sample that turns up almost nothing to convert cannot choose a target, so
+# fall back to the whole column rather than decide on a handful of values.
+MIN_TARGET_SAMPLE = 100
+
+# Rows drawn per row wanted. Nulls and placeholders do not help the decision,
+# so a mostly-empty column needs more raw rows to yield enough real values.
+OVERSAMPLE = 5
+
+# Coercions the convertibility check can measure against, in the order
+# clean_column would try them.
+TARGETS = {"numeric": _to_numeric, "datetime": _to_datetime}
+
+
+def convertibility(s: pd.Series, target: str | None = None, max_pct: float = CONTAMINATION_MAX_PCT) -> dict:
+    """Measure how close a text column is to being wholly convertible.
+
+    The question discover_specials cannot answer. That one asks whether a
+    SHORT LIST of values is blocking a conversion, and rejects a column with
+    too many distinct offenders. This asks whether a SMALL SHARE OF ROWS is
+    blocking it, however many distinct forms they take — the shape that means
+    something upstream is wrong rather than that the column has sentinels.
+
+    IMDb's runtimeMinutes is the case in point: 32 bad rows in 12.7M, but 13
+    distinct values. Over the sentinel cap, far under any row threshold.
+
+    Deliberately unsampled. Contamination this rare is invisible to a sample —
+    32 rows in 12.7M against a 100k sample is a quarter of an expected hit —
+    so this is one full pass over the column. That is the cost of finding it
+    at all.
+
+    Reports; never judges. No threshold is applied and nothing is flagged:
+    the counts are returned and the caller decides what share is tolerable.
+
+    Parameters
+    ----------
+    s : pandas.Series
+        Column as it arrived. A non-text column has nothing to measure.
+    target : {"numeric", "datetime"} or None, default None
+        Which coercion to measure against. None tries each in turn and keeps
+        the best fit, stopping early when one converts everything — nothing
+        can beat no failures, so the second pass is not run.
+
+    Returns
+    -------
+    dict
+        target, n_rows, n_null, n_placeholder, n_unconvertible, n_infinite,
+        pct_unconvertible, and values — the distinct offenders with counts,
+        at most MAX_UNCONVERTIBLE_VALUES of them.
+
+    Raises
+    ------
+    KeyError
+        If target is not one of TARGETS.
+    """
+    # Choosing the target is a majority question, so it runs on a sample and
+    # costs almost nothing. Only the count below needs the whole column.
+    if target is None:
+        target = best_target(s)
+
+    convert = TARGETS[target]
+
+    empty = {
+        "target": target,
+        "verdict": "clean",
+        "n_rows": len(s),
+        "n_null": missing_count(s),
+        "n_placeholder": 0,
+        "n_unconvertible": 0,
+        "n_infinite": 0,
+        "pct_unconvertible": 0.0,
+        "values": {},
+    }
+    if not _is_text(s):
+        return empty
+
+    stripped = remove_whitespace(s)
+    nulled = to_null(stripped)
+
+    # Placeholders are counted separately rather than lumped in with the
+    # failures. "30% of this column is \N" is a different problem from "30%
+    # of it will not parse", and by the time the coercion runs the
+    # placeholders are already null and would be invisible.
+    n_null = missing_count(s)
+    n_placeholder = missing_count(nulled) - n_null
+
+    # Symbols come off before the coercion, exactly as clean_numbers does it,
+    # so "$1,234" is not reported as unconvertible.
+    prepared = strip_numeric_symbols(nulled) if target == "numeric" else nulled
+    converted = convert(prepared)
+
+    # Failed: null after, not null before. The placeholders are already null
+    # on both sides, so they do not land here.
+    lost = missing_mask(converted) & ~missing_mask(nulled)
+    n_unconvertible = int(lost.sum())
+
+    # Infinities are the opposite failure: 'inf' converts cleanly and then
+    # poisons every mean downstream. Counted so it cannot pass unnoticed.
+    n_infinite = 0
+    if pd.api.types.is_numeric_dtype(converted.dtype):
+        n_infinite = int(np.isinf(converted.to_numpy(dtype="float64", na_value=np.nan)).sum())
+
+    # Denominator is rows that had something to convert: total less the nulls
+    # and placeholders. A column that is 90% empty should not look 90% clean.
+    convertible_rows = len(s) - n_null - n_placeholder
+    pct = round(n_unconvertible / convertible_rows * 100, 4) if convertible_rows else 0.0
+
+    # A column that fails almost everywhere was never this kind of column.
+    # Saying so, and reporting nothing, beats listing twenty titles as
+    # "offending values" in a report meant to surface the odd bad row.
+    if pct > max_pct:
+        return {
+            "target": target,
+            "verdict": "text",
+            "n_rows": len(s),
+            "n_null": n_null,
+            "n_placeholder": n_placeholder,
+            "n_unconvertible": 0,
+            "n_infinite": n_infinite,
+            "pct_unconvertible": 0.0,
+            "values": {},
+        }
+
+    return {
+        "target": target,
+        "verdict": "contaminated" if n_unconvertible else "clean",
+        "n_rows": len(s),
+        "n_null": n_null,
+        "n_placeholder": n_placeholder,
+        "n_unconvertible": n_unconvertible,
+        "n_infinite": n_infinite,
+        "pct_unconvertible": pct,
+        # value_counts on the offenders only, so this is bounded by how many
+        # distinct bad values there are, not by the size of the column.
+        "values": nulled[lost].value_counts().head(MAX_UNCONVERTIBLE_VALUES).to_dict(),
+    }
+
+
+def best_target(s: pd.Series, sample_n: int | None = TARGET_SAMPLE) -> str:
+    """Which coercion this column is closest to satisfying.
+
+    Decided on a sample, deliberately. This is a question about the bulk of
+    the column — is it mostly numbers or mostly dates — and a sample answers
+    that with room to spare. It is the opposite of the failure count in
+    convertibility, which is about a handful of rare values and cannot be
+    sampled at all.
+
+    Doing it this way is also what keeps a merely-numeric column off the date
+    coercion, which parses value by value and is the expensive one.
+
+    Ties go to the first target tried, so a column that converts perfectly
+    both ways is reported as numeric.
+
+    Parameters
+    ----------
+    s : pandas.Series
+        Column as it arrived.
+    sample_n : int or None, default TARGET_SAMPLE
+        Rows to decide on. None uses the whole column. A sample holding fewer
+        than MIN_TARGET_SAMPLE convertible values falls back to the whole
+        column, since a column that is nearly all nulls gives a sample almost
+        nothing to judge by.
+
+    Returns
+    -------
+    str
+        A key of TARGETS.
+    """
+    if not _is_text(s):
+        return "numeric"
+
+    # Sample the raw column FIRST, then prepare only those rows. Preparing
+    # the whole column before sampling costs a full pass of string operations
+    # and throws almost all of it away — which defeats the point of sampling.
+    candidates = s
+    if sample_n is not None and len(s) > sample_n:
+        # Oversample, because nulls and placeholders do not count towards the
+        # decision and a column can be mostly empty.
+        candidates = s.sample(n=min(len(s), sample_n * OVERSAMPLE), random_state=1)
+
+    candidates = to_null(remove_whitespace(candidates)).dropna()
+
+    # Too little survived to judge by, so look at everything rather than
+    # decide a whole column on a handful of values.
+    if len(candidates) < MIN_TARGET_SAMPLE and sample_n is not None and len(s) > sample_n:
+        candidates = to_null(remove_whitespace(s)).dropna()
+
+    if candidates.empty:
+        return "numeric"
+
+    if sample_n is not None and len(candidates) > sample_n:
+        candidates = candidates.iloc[:sample_n]
+
+    fewest = None
+    chosen = "numeric"
+
+    # Explicit loop: each pass coerces the sample, which is real work.
+    for name in TARGETS:
+        probe = strip_numeric_symbols(candidates) if name == "numeric" else candidates
+        failures = int(TARGETS[name](probe).isna().sum())
+        if fewest is None or failures < fewest:
+            fewest = failures
+            chosen = name
+        if fewest == 0:
+            break  # nothing beats a clean conversion
+
+    return chosen
+
+
+def find_unconvertible(
+    df: pd.DataFrame,
+    columns: list | None = None,
+    target: str | None = None,
+    max_rows: int = 1000,
+    max_pct: float = CONTAMINATION_MAX_PCT,
+) -> pd.DataFrame:
+    """The individual rows a coercion would lose, so they can be looked at.
+
+    The record says a column has 32 bad rows. This says which rows, and what
+    is in them — the step before deciding whether they are sentinels, a
+    parsing bug, or genuine text.
+
+    Output is capped at max_rows regardless of input size, so a column that is
+    half rubbish returns the same size answer as one with a handful of typos.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Frame to inspect. Non-text columns are skipped.
+    columns : list or None, default None
+        Columns to check. None checks every column.
+    target : {"numeric", "datetime"} or None, default None
+        Coercion to measure against. None picks each column's best fit.
+    max_rows : int, default 1000
+        Ceiling on returned rows, taken in frame order.
+    max_pct : float, default CONTAMINATION_MAX_PCT
+        Skip a column when more than this share of its convertible rows
+        fail. A column where most values will not coerce is simply text, and
+        listing every row of it buries the columns that are contaminated.
+        Tighten it to 5 to see only the near-clean ones.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns: index, column, value. Empty when nothing failed.
+    """
+    if columns is None:
+        columns = list(df.columns)
+
+    found = []
+    remaining = max_rows
+
+    for col in columns:
+        if remaining <= 0:
+            break
+
+        s = df[col]
+        if not _is_text(s):
+            continue
+
+        # One measurement decides the target and the share in the same pass.
+        measured = convertibility(s, target=target, max_pct=max_pct)
+        column_target = measured["target"]
+        if measured["verdict"] != "contaminated":
+            continue
+
+        nulled = to_null(remove_whitespace(s))
+        prepared = strip_numeric_symbols(nulled) if column_target == "numeric" else nulled
+        lost = missing_mask(TARGETS[column_target](prepared)) & ~missing_mask(nulled)
+
+        # head() before building the frame, so a ruined column cannot
+        # materialise millions of rows here.
+        offenders = s[lost].head(remaining)
+        found.append(
+            pd.DataFrame(
+                {
+                    "index": offenders.index,
+                    "column": col,
+                    "value": offenders.to_numpy(),
+                }
+            )
+        )
+        remaining -= len(offenders)
+
+    if not found:
+        return pd.DataFrame(columns=["index", "column", "value"])
+
+    return pd.concat(found, ignore_index=True)
+
+
+# Above this share of distinct values a category costs more than it saves.
+# Measured on 2M rows of 20-character strings: at a 0.025 ratio the column
+# shrinks 12x, at 0.20 only 3.3x, and at 0.50 just 1.4x — by which point the
+# categories array is most of the column and the awkwardness is not repaid.
+CATEGORY_MAX_RATIO = 0.05
+
+# An absolute ceiling as well as a ratio. Past roughly this many categories
+# the codes are int32 anyway, so the saving stops improving, while the
+# categories array keeps growing and every operation carries it around.
+CATEGORY_MAX_UNIQUE = 50_000
+
+# Rows to look at when rejecting a column as too varied to be categorical.
+# A sample can only ever UNDER-count distinct values, so a sample that looks
+# varied proves the column is varied — a sound rejection. A sample that looks
+# repetitive proves nothing, and those columns get the full pass.
+CATEGORY_SAMPLE = 10_000
+
+# Distinct share within the sample above which the column is rejected without
+# a full pass. Deliberately loose: it only has to catch the obviously varied.
+CATEGORY_SAMPLE_MAX_RATIO = 0.5
+
+
+def category_profile(
+    s: pd.Series,
+    sample_n: int | None = CATEGORY_SAMPLE,
+    max_ratio: float = CATEGORY_MAX_RATIO,
+    max_unique: int = CATEGORY_MAX_UNIQUE,
+) -> dict:
+    """Whether a text column is worth holding as a category, and what it saves.
+
+    Two stages, for the same reason best_target has two. Deciding a column is
+    too varied is a question about the bulk of it, so a sample settles it and
+    the expensive full count is never paid. Getting the categories themselves
+    is not: a value occurring twice in 90M rows is invisible to any sample and
+    must still become a category, or converting the column would silently drop
+    it. So the sample rejects, and whatever survives is counted in full.
+
+    Proposes; never acts. Nothing is converted here — the caller decides,
+    because a category changes behaviour well beyond memory: concatenating two
+    categoricals with different categories reverts to object, assigning an
+    unseen value raises, and groupby(observed=False) emits a row per category
+    whether or not it occurs.
+
+    Parameters
+    ----------
+    s : pandas.Series
+        Column as it arrived. A non-text column is not a candidate.
+    sample_n : int or None, default CATEGORY_SAMPLE
+        Rows for the rejection filter. None skips it and counts in full.
+    max_ratio : float, default CATEGORY_MAX_RATIO
+        Largest distinct-to-rows share still worth converting.
+    max_unique : int, default CATEGORY_MAX_UNIQUE
+        Largest number of categories still worth converting.
+
+    Returns
+    -------
+    dict
+        as_category, n_unique, ratio, bytes_before, bytes_after, saving, and
+        rejected_by — which test failed, or None. n_unique is -1 when the
+        sample rejected the column, since no full count was taken.
+    """
+    unknown = {
+        "as_category": False,
+        "n_unique": -1,
+        "ratio": None,
+        "bytes_before": int(s.memory_usage(deep=True, index=False)),
+        "bytes_after": None,
+        "saving": None,
+        "rejected_by": None,
+    }
+
+    if not _is_text(s):
+        return {**unknown, "rejected_by": "not text"}
+
+    non_null = s.dropna()
+    if non_null.empty:
+        return {**unknown, "rejected_by": "empty"}
+
+    # Stage one: reject the obviously varied without counting everything.
+    if sample_n is not None and len(non_null) > sample_n:
+        sampled = non_null.sample(n=sample_n, random_state=1)
+        if sampled.nunique() / len(sampled) > CATEGORY_SAMPLE_MAX_RATIO:
+            return {**unknown, "rejected_by": "sample"}
+
+    # Stage two: the exact count, over everything. A category seen twice in
+    # 90M rows is still a category, and no sample would have found it.
+    n_unique = int(non_null.nunique())
+    ratio = n_unique / len(non_null)
+
+    rejected_by = None
+    if n_unique > max_unique:
+        rejected_by = "max_unique"
+    elif ratio > max_ratio:
+        rejected_by = "max_ratio"
+
+    bytes_before = int(s.memory_usage(deep=True, index=False))
+    profile = {
+        "as_category": rejected_by is None,
+        "n_unique": n_unique,
+        "ratio": round(ratio, 6),
+        "bytes_before": bytes_before,
+        "bytes_after": None,
+        "saving": None,
+        "rejected_by": rejected_by,
+    }
+
+    # Only measure the converted size for columns actually worth converting;
+    # building a category to find out it was a bad idea is the cost being
+    # avoided.
+    if rejected_by is None:
+        bytes_after = int(s.astype("category").memory_usage(deep=True, index=False))
+        profile["bytes_after"] = bytes_after
+        profile["saving"] = round(bytes_before / bytes_after, 1) if bytes_after else None
+
+    return profile
+
+
+def to_category(s: pd.Series, **kwargs) -> pd.Series:
+    """Convert a column to a category when category_profile says it is worth it.
+
+    Parameters
+    ----------
+    s : pandas.Series
+        Column to consider.
+    **kwargs
+        Passed to category_profile: sample_n, max_ratio, max_unique.
+
+    Returns
+    -------
+    pandas.Series
+        The column as a category, or unchanged when it is not a candidate.
+    """
+    if not category_profile(s, **kwargs)["as_category"]:
+        return s
+
+    # astype reads the whole column, so rare categories are included by
+    # construction — this is the full pass the sample could not replace.
+    return s.astype("category")
+
+
 def column_record(
     name: str,
     before: pd.Series,
@@ -427,6 +923,8 @@ def column_record(
     specials: list,
     dtype_effective: str,
     n_unique: int,
+    convertible: dict | None = None,
+    category: dict | None = None,
 ) -> dict:
     """One record row, with the four new fields alongside the existing ones.
 
@@ -447,6 +945,18 @@ def column_record(
     # this is 0 when nothing was found, with no special case.
     specials_count = int(before.isin(specials).sum())
 
+    # A measurement, not a verdict: no threshold is applied here. The caller
+    # sorts or filters on pct_unconvertible to decide what counts as a
+    # problem, because 5% means something different at 20 rows and at 12M.
+    if convertible is None:
+        convertible = convertibility(before)
+
+    # Also a measurement, not an action. clean_dataframe does not convert on
+    # the strength of this: a category changes behaviour beyond memory, so
+    # the caller opts in.
+    if category is None:
+        category = category_profile(before)
+
     return {
         "column": name,
         "dtype_before": dtype_before,
@@ -462,6 +972,26 @@ def column_record(
         "specials_count": specials_count,
         # Carried so bin_column can skip its own cardinality probe.
         "n_unique": n_unique,
+        # Rows a coercion would lose that are neither null nor placeholder —
+        # the "funnies" worth looking at before anything is nulled.
+        # clean / contaminated / text — filter the report on this rather than
+        # eyeballing which 100% figures are meaningful.
+        "unconvertible_verdict": convertible["verdict"],
+        "n_unconvertible": convertible["n_unconvertible"],
+        "pct_unconvertible": convertible["pct_unconvertible"],
+        # Bounded evidence: the distinct offenders with their row counts.
+        "unconvertible_values": convertible["values"],
+        # Counted apart from the failures. By coercion time these are already
+        # null, so without this they would be invisible.
+        "n_placeholder": convertible["n_placeholder"],
+        # 'inf' coerces cleanly and then poisons every mean downstream.
+        "n_infinite": convertible["n_infinite"],
+        # Whether holding this column as a category is worth it, and by how
+        # much. -1 categories means the sample rejected it without counting.
+        "as_category": category["as_category"],
+        "n_categories": category["n_unique"],
+        "category_ratio": category["ratio"],
+        "category_saving": category["saving"],
         "bytes_before": bytes_before,
         "bytes_after": bytes_after,
         "bytes_saved": bytes_before - bytes_after,
@@ -479,6 +1009,7 @@ def clean_dataframe(
     inplace: bool = False,
     specials: dict | None = None,
     discover: bool = True,
+    categorize: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Clean every column, returning the frame and a record of what changed.
 
@@ -500,6 +1031,10 @@ def clean_dataframe(
     discover : bool, default True
         Propose sentinels for text columns the coercions refused. Costs one
         sampled pass per unconverted text column. Set False to skip it.
+    categorize : bool, default False
+        Convert columns the category profile approves. Off by default: the
+        record reports what each column would save, and converting changes
+        behaviour beyond memory, so it is opted into rather than out of.
 
     Returns
     -------
@@ -534,11 +1069,21 @@ def clean_dataframe(
                 after=after,
                 specials=found,
                 dtype_effective=effective_dtype(before, found),
+                # One call: it picks the target and returns that pass's counts.
+                convertible=convertibility(before),
+                category=category_profile(before),
                 # Cheap relative to the cleaning pass, and it saves bin_column
                 # a hash of its own later.
                 n_unique=int(before.nunique()),
             )
         )
+
+        # Convert only when asked, and only on the verdict already computed,
+        # so the column is not profiled twice.
+        if categorize and records[-1]["as_category"]:
+            after = after.astype("category")
+            records[-1]["dtype_after"] = str(after.dtype)
+            records[-1]["converted"] = records[-1]["dtype_before"] != records[-1]["dtype_after"]
 
         # Assign back one column at a time so the old one can be freed before
         # the next is built.

@@ -1,26 +1,38 @@
 """Test the column cleaning functions."""
 
 import pandas as pd
+import pytest
 from pandas.testing import assert_series_equal
 
 from datkit.cleaning import (
+    CATEGORY_MAX_RATIO,
+    CATEGORY_MAX_UNIQUE,
+    CONTAMINATION_MAX_PCT,
     MAX_SPECIALS,
+    MAX_UNCONVERTIBLE_VALUES,
     _guess_format,
     _is_text,
     _to_datetime,
     _to_numeric,
+    best_target,
+    category_profile,
     clean_column,
     clean_column_dtype,
     clean_dataframe,
     clean_dates,
     clean_numbers,
     column_record,
+    convertibility,
     discover_specials,
     effective_dtype,
     failed_values,
+    find_unconvertible,
     missing_count,
+    missing_mask,
     remove_whitespace,
     sample_records,
+    strip_numeric_symbols,
+    to_category,
     to_null,
     uppercase,
 )
@@ -535,6 +547,16 @@ def test_record_is_a_dataframe_with_the_expected_columns():
         "specials",
         "specials_count",
         "n_unique",
+        "n_unconvertible",
+        "pct_unconvertible",
+        "unconvertible_values",
+        "n_placeholder",
+        "n_infinite",
+        "unconvertible_verdict",
+        "as_category",
+        "n_categories",
+        "category_ratio",
+        "category_saving",
         "bytes_before",
         "bytes_after",
         "bytes_saved",
@@ -980,6 +1002,16 @@ def test_column_record_has_the_expected_fields():
         "specials",
         "specials_count",
         "n_unique",
+        "n_unconvertible",
+        "pct_unconvertible",
+        "unconvertible_values",
+        "n_placeholder",
+        "n_infinite",
+        "unconvertible_verdict",
+        "as_category",
+        "n_categories",
+        "category_ratio",
+        "category_saving",
         "bytes_before",
         "bytes_after",
         "bytes_saved",
@@ -1038,3 +1070,659 @@ def test_column_record_nulls_created_is_zero_when_nothing_is_lost():
 def test_column_record_n_unique_is_carried_through():
     """Recorded so bin_column can skip a cardinality probe of its own."""
     assert make_record(values=("1", "1", "2"), specials=())["n_unique"] == 2
+
+
+# --- strip_numeric_symbols ------------------------------------------------
+
+
+def test_strip_numeric_symbols_removes_currency_and_grouping():
+    """The decorations come off; the digits stay."""
+    result = strip_numeric_symbols(pd.Series(["$1,234", "R56", "78%"]))
+    assert result.tolist() == ["1234", "56", "78"]
+
+
+def test_strip_numeric_symbols_leaves_non_text_untouched():
+    """A numeric column has no strings to strip."""
+    original = pd.Series([1, 2, 3])
+    assert_series_equal(strip_numeric_symbols(original), original)
+
+
+def test_strip_numeric_symbols_matches_what_clean_numbers_uses():
+    """Shared on purpose.
+
+    If these drifted apart the convertibility check would report "1,234" as
+    unconvertible while clean_numbers converted it happily.
+    """
+    raw = pd.Series(["$1,234", "$5,678"])
+    assert clean_numbers(raw).tolist() == [int(v) for v in strip_numeric_symbols(raw)]
+
+
+# --- convertibility -------------------------------------------------------
+#
+# The counterpart to discover_specials. That one thresholds on DISTINCT
+# VALUES and rejects a column with too many; this thresholds on nothing at
+# all and reports the ROW SHARE. The case it exists for is contamination:
+# few rows, many distinct forms — IMDb's runtimeMinutes carries 32 bad rows
+# across 13 distinct values in 12.7M, over the sentinel cap and far under any
+# row threshold.
+
+
+def test_convertibility_counts_the_failures():
+    """Rows that will not coerce, and the values behind them."""
+    s = pd.Series(["1", "2", "Talk-Show", "4"], dtype=object)
+    result = convertibility(s, target="numeric")
+    assert result["n_unconvertible"] == 1
+    assert result["values"] == {"Talk-Show": 1}
+
+
+def test_convertibility_reports_the_share_of_convertible_rows():
+    """The percentage is over rows that had something to convert."""
+    s = pd.Series(["1", "2", "3", "bad"], dtype=object)
+    assert convertibility(s, target="numeric")["pct_unconvertible"] == 25.0
+
+
+def test_convertibility_excludes_placeholders_from_the_denominator():
+    """A mostly-empty column is not thereby mostly clean.
+
+    Two real values, one of them bad, and two placeholders. The share is 50%
+    of what could be converted, not 25% of the rows.
+    """
+    s = pd.Series(["1", "bad", r"\N", "NA"], dtype=object)
+    result = convertibility(s, target="numeric")
+    assert result["n_placeholder"] == 2
+    assert result["n_unconvertible"] == 1
+    assert result["pct_unconvertible"] == 50.0
+
+
+def test_convertibility_counts_placeholders_separately():
+    """Placeholder tokens are counted apart from parse failures.
+
+    "30% of this column is a null token" is a different problem from "30% of
+    it will not parse", and by coercion time the placeholders are already
+    null, so without this they would be invisible.
+    """
+    s = pd.Series(["1", "2", r"\N", "N/A", "-"], dtype=object)
+    result = convertibility(s, target="numeric")
+    assert result["n_placeholder"] == 3
+    assert result["n_unconvertible"] == 0
+
+
+def test_convertibility_does_not_blame_decorated_numbers():
+    """Symbols come off first, exactly as clean_numbers does it.
+
+    Without the shared strip, every thousands separator would be reported as
+    contamination.
+    """
+    s = pd.Series(["$1,234", "R56", "78%"], dtype=object)
+    assert convertibility(s, target="numeric")["n_unconvertible"] == 0
+
+
+def test_convertibility_counts_infinities():
+    """The opposite failure: 'inf' converts cleanly, then poisons every mean."""
+    s = pd.Series(["1", "2", "inf", "-inf"], dtype=object)
+    result = convertibility(s, target="numeric")
+    assert result["n_unconvertible"] == 0
+    assert result["n_infinite"] == 2
+
+
+def test_convertibility_handles_dates():
+    """Same measurement against the date coercion."""
+    s = pd.Series(["2020-01-01", "2020-02-01", "not collected"], dtype=object)
+    assert convertibility(s, target="datetime")["n_unconvertible"] == 1
+
+
+def test_convertibility_bounds_the_evidence():
+    """Output size is fixed however contaminated the column is.
+
+    Contaminated, not text: a column that fails everywhere is reported as
+    text with no evidence at all, so the cap is only visible on a column
+    where the failures are a minority.
+    """
+    values = [str(i) for i in range(5_000)] + [f"bad_{i}" for i in range(500)]
+    s = pd.Series(values, dtype=object)
+    assert len(convertibility(s, target="numeric")["values"]) == MAX_UNCONVERTIBLE_VALUES
+
+
+def test_convertibility_skips_non_text_columns():
+    """Nothing to measure, and no crash on the object-of-ints shape."""
+    assert convertibility(pd.Series([1, 2, 3], dtype=object))["n_unconvertible"] == 0
+    assert convertibility(pd.Series([1.5, 2.5]))["n_unconvertible"] == 0
+
+
+def test_convertibility_finds_what_discovery_rejects():
+    """The whole point of having both.
+
+    Thirteen distinct offenders in a large column: over MAX_SPECIALS, so
+    discover_specials proposes nothing, while convertibility reports every one.
+    """
+    values = [str(i) for i in range(5000)] + [f"Genre-{i}" for i in range(13)]
+    s = pd.Series(values, dtype=object)
+
+    assert discover_specials(s, sample_n=None) == []
+    result = convertibility(s, target="numeric")
+    assert result["n_unconvertible"] == 13
+    assert result["pct_unconvertible"] < 1.0
+
+
+def test_convertibility_rejects_an_unknown_target():
+    """Targets are a closed set, so a typo fails loudly."""
+    with pytest.raises(KeyError):
+        convertibility(pd.Series(["1"], dtype=object), target="nmeric")
+
+
+# --- best_target ----------------------------------------------------------
+
+
+def test_best_target_picks_numeric_for_numbers():
+    """Fewest failures wins."""
+    assert best_target(pd.Series(["1", "2", "3"], dtype=object)) == "numeric"
+
+
+def test_best_target_picks_datetime_for_dates():
+    """A date column fails the numeric coercion on every row."""
+    assert best_target(pd.Series(["2020-01-01", "2020-02-01"], dtype=object)) == "datetime"
+
+
+def test_best_target_breaks_ties_towards_numeric():
+    """Text fails both equally, so the first target tried is reported."""
+    assert best_target(pd.Series(["alpha", "beta"], dtype=object)) == "numeric"
+
+
+# --- find_unconvertible ---------------------------------------------------
+
+
+def make_contaminated_frame():
+    """A frame with a handful of bad values in one numeric column."""
+    return pd.DataFrame(
+        {
+            "runtime": pd.Series(["90", "Talk-Show", "120", "Reality-TV"], dtype=object),
+            "title": pd.Series(["a", "b", "c", "d"], dtype=object),
+        }
+    )
+
+
+def test_find_unconvertible_returns_the_offending_rows():
+    """Index, column and value, so the records can be looked at."""
+    found = find_unconvertible(make_contaminated_frame(), target="numeric")
+    assert found["column"].tolist() == ["runtime", "runtime"]
+    assert found["value"].tolist() == ["Talk-Show", "Reality-TV"]
+    assert found["index"].tolist() == [1, 3]
+
+
+def test_find_unconvertible_preserves_the_frames_index():
+    """A real key column comes back, not a positional number."""
+    frame = make_contaminated_frame().set_index(pd.Index(["tt01", "tt02", "tt03", "tt04"]))
+    assert find_unconvertible(frame, target="numeric")["index"].tolist() == ["tt02", "tt04"]
+
+
+def test_find_unconvertible_caps_its_output():
+    """Output size is fixed regardless of how contaminated the column is."""
+    values = [str(i) for i in range(10_000)] + [f"bad_{i}" for i in range(5_000)]
+    frame = pd.DataFrame({"x": pd.Series(values, dtype=object)})
+    assert len(find_unconvertible(frame, target="numeric", max_rows=25)) == 25
+
+
+def test_find_unconvertible_spends_its_budget_across_columns():
+    """The cap is on the whole result, not per column."""
+    contaminated = [str(i) for i in range(100)] + ["bad"] * 50
+    frame = pd.DataFrame(
+        {
+            "a": pd.Series(contaminated, dtype=object),
+            "b": pd.Series(contaminated, dtype=object),
+        }
+    )
+    found = find_unconvertible(frame, target="numeric", max_rows=30)
+    assert len(found) == 30
+
+
+def test_find_unconvertible_can_be_limited_to_columns():
+    """Only the named columns are inspected."""
+    frame = make_contaminated_frame()
+    frame["runtime2"] = frame["runtime"]
+
+    found = find_unconvertible(frame, columns=["runtime2"], target="numeric")
+    assert found["column"].unique().tolist() == ["runtime2"]
+
+
+def test_find_unconvertible_skips_columns_that_are_simply_text():
+    """A column failing everywhere is text, and its rows are not findings.
+
+    Without this the title column of any frame drowns out the one column
+    that actually has a handful of bad values in it.
+    """
+    frame = make_contaminated_frame()
+    assert "title" not in find_unconvertible(frame, target="numeric")["column"].tolist()
+
+
+def test_find_unconvertible_max_pct_is_adjustable():
+    """Raising the ceiling admits the text columns again."""
+    frame = make_contaminated_frame()
+    found = find_unconvertible(frame, target="numeric", max_pct=100.0)
+    assert "title" in found["column"].tolist()
+
+
+def test_find_unconvertible_max_pct_can_be_tightened():
+    """Dropping it to 5 keeps only the near-clean columns."""
+    frame = make_contaminated_frame()
+    assert find_unconvertible(frame, target="numeric", max_pct=5.0).empty
+
+
+def test_find_unconvertible_returns_an_empty_frame_when_clean():
+    """The columns are present even with no rows, so callers need no guard."""
+    frame = pd.DataFrame({"x": pd.Series(["1", "2"], dtype=object)})
+    found = find_unconvertible(frame, target="numeric")
+    assert found.empty
+    assert found.columns.tolist() == ["index", "column", "value"]
+
+
+def test_find_unconvertible_skips_non_text_columns():
+    """Same gate as everything else."""
+    frame = pd.DataFrame({"x": pd.Series([1, 2, 3], dtype=object)})
+    assert find_unconvertible(frame, target="numeric").empty
+
+
+def test_find_unconvertible_chooses_a_target_per_column():
+    """With no target given, each column is judged against its own best fit."""
+    frame = pd.DataFrame(
+        {
+            "runtime": pd.Series(["90", "Talk-Show", "120"], dtype=object),
+            "released": pd.Series(["2020-01-01", "2020-02-01", "not collected"], dtype=object),
+        }
+    )
+    found = find_unconvertible(frame)
+    assert sorted(found["value"].tolist()) == ["Talk-Show", "not collected"]
+
+
+# --- the convertibility fields on the record ------------------------------
+
+
+def test_record_carries_the_convertibility_fields():
+    """clean_dataframe surfaces the measurement per column."""
+    _, record = clean_dataframe(make_contaminated_frame())
+    by_column = record.set_index("column")
+
+    assert by_column.loc["runtime", "n_unconvertible"] == 2
+    assert by_column.loc["runtime", "pct_unconvertible"] == 50.0
+    assert by_column.loc["runtime", "unconvertible_values"] == {"Talk-Show": 1, "Reality-TV": 1}
+
+
+def test_record_reports_placeholders_per_column():
+    """Previously invisible: by coercion time these are already null."""
+    frame = pd.DataFrame({"x": pd.Series(["1", "2", r"\N", "NA"], dtype=object)})
+    _, record = clean_dataframe(frame)
+    assert record.set_index("column").loc["x", "n_placeholder"] == 2
+
+
+def test_convertibility_picks_its_own_target_by_default():
+    """With no target given it reports which coercion it measured against."""
+    assert convertibility(pd.Series(["1", "2", "3"], dtype=object))["target"] == "numeric"
+    assert convertibility(pd.Series(["2020-01-01", "2020-02-01"], dtype=object))["target"] == "datetime"
+
+
+def test_convertibility_agrees_with_an_explicit_target():
+    """Choosing the target and being handed it give the same measurement."""
+    s = pd.Series(["1", "2", "Talk-Show"], dtype=object)
+    assert convertibility(s) == convertibility(s, target="numeric")
+
+
+def test_convertibility_stops_once_a_target_converts_the_majority():
+    """The short-circuit that keeps a numeric column off the date coercion.
+
+    A mostly-numeric column cannot also be mostly dates, so the remaining
+    passes cannot change the answer. Asserted through the reported target
+    rather than by timing, which would be flaky.
+    """
+    values = [str(i) for i in range(1000)] + ["Talk-Show"] * 5
+    assert convertibility(pd.Series(values, dtype=object))["target"] == "numeric"
+
+
+def test_best_target_uses_a_sample():
+    """Deciding the target does not depend on reading the whole column.
+
+    The same answer from a 100-row sample as from everything, which is the
+    property that lets clean_dataframe skip a full date coercion on a column
+    that is plainly numeric.
+    """
+    values = [str(i) for i in range(50_000)]
+    s = pd.Series(values, dtype=object)
+    assert best_target(s, sample_n=100) == best_target(s, sample_n=None) == "numeric"
+
+
+def test_best_target_falls_back_when_the_sample_is_mostly_empty():
+    """A nearly-empty column is judged on everything rather than on nothing.
+
+    Sampling a column that is 99.9% placeholder can turn up too few real
+    values to decide by, so the fallback reads the whole column instead.
+    """
+    values = [r"\N"] * 20_000 + ["2020-01-15"] * 30
+    assert best_target(pd.Series(values, dtype=object), sample_n=100) == "datetime"
+
+
+def test_best_target_handles_an_all_placeholder_column():
+    """Nothing to judge by at all, and no crash."""
+    assert best_target(pd.Series([r"\N", "NA"], dtype=object)) == "numeric"
+
+
+def test_best_target_skips_non_text_columns():
+    """Same gate as everything else."""
+    assert best_target(pd.Series([1, 2, 3], dtype=object)) == "numeric"
+
+
+def test_sampled_target_still_finds_rare_contamination():
+    """The division of labour, asserted end to end.
+
+    The target is chosen on a sample; the failure count is not. Rare
+    contamination invisible to any sample is still counted exactly.
+    """
+    values = [str(i) for i in range(200_000)] + ["Talk-Show"] * 3
+    result = convertibility(pd.Series(values, dtype=object))
+    assert result["target"] == "numeric"
+    assert result["n_unconvertible"] == 3
+
+
+# --- category_profile -----------------------------------------------------
+#
+# The same two-stage split as best_target, for a sharper reason. A sample can
+# only ever UNDER-count distinct values, so a sample that looks varied proves
+# the column is varied and can be rejected outright. A sample that looks
+# repetitive proves nothing — a category occurring twice in 90M rows is
+# invisible to it — so those columns are counted in full.
+#
+# The thresholds come from measurement on 2M rows of 20-character strings:
+# a 0.025 ratio shrinks the column 12x, 0.20 only 3.3x, 0.50 just 1.4x.
+
+
+def test_category_profile_accepts_a_repetitive_column():
+    """Few distinct values over many rows is what a category is for."""
+    s = pd.Series(["movie", "short", "tvEpisode"] * 1000, dtype=object)
+    profile = category_profile(s)
+    assert profile["as_category"]
+    assert profile["n_unique"] == 3
+    assert profile["saving"] > 1
+
+
+def test_category_profile_rejects_an_identifier_column():
+    """Every value distinct is the opposite of a category."""
+    s = pd.Series([f"tt{i:08d}" for i in range(5000)], dtype=object)
+    assert not category_profile(s)["as_category"]
+
+
+def test_category_profile_rejects_on_the_ratio():
+    """Few enough categories, but not few enough relative to the rows."""
+    values = [f"v{i}" for i in range(200)] * 2
+    profile = category_profile(pd.Series(values, dtype=object), sample_n=None)
+    assert profile["ratio"] > CATEGORY_MAX_RATIO
+    assert profile["rejected_by"] == "max_ratio"
+
+
+def test_category_profile_rejects_on_the_absolute_cap():
+    """The absolute ceiling rejects a column the ratio would have allowed.
+
+    Past it the codes are int32 anyway, so the saving stops improving while
+    the categories array keeps growing.
+    """
+    n = CATEGORY_MAX_UNIQUE + 1
+    values = [f"v{i}" for i in range(n)] + ["v0"] * (n * 30)
+    profile = category_profile(pd.Series(values, dtype=object), sample_n=None)
+    assert profile["rejected_by"] == "max_unique"
+
+
+def test_category_profile_sample_rejects_without_a_full_count():
+    """A varied column is thrown out before anything is counted exactly.
+
+    n_unique comes back as -1 to say so, rather than a number that was never
+    computed.
+    """
+    s = pd.Series([f"id_{i}" for i in range(50_000)], dtype=object)
+    profile = category_profile(s, sample_n=1000)
+    assert profile["rejected_by"] == "sample"
+    assert profile["n_unique"] == -1
+
+
+def test_category_profile_keeps_rare_categories():
+    """The full pass is what the sample cannot replace.
+
+    One value occurs twice in 60,000 rows. A 1,000-row sample would almost
+    certainly never see it, but it is still a category and dropping it would
+    lose those rows.
+    """
+    values = ["common"] * 60_000 + ["rare"] * 2
+    s = pd.Series(values, dtype=object)
+    assert category_profile(s, sample_n=1000)["n_unique"] == 2
+    assert set(to_category(s, sample_n=1000).cat.categories) == {"common", "rare"}
+
+
+def test_category_profile_skips_non_text_columns():
+    """Numbers are not categories here, whatever their cardinality."""
+    assert category_profile(pd.Series([1, 2, 3], dtype=object))["rejected_by"] == "not text"
+    assert category_profile(pd.Series([1.5, 2.5]))["rejected_by"] == "not text"
+
+
+def test_category_profile_handles_an_all_null_column(text_dtype):
+    """Nothing to count, and no crash, whatever the string backend.
+
+    The two backends take different routes to the same answer. An all-null
+    `string` or Arrow column still declares itself text, so it reaches the
+    empty check; an all-None object column is not text at all, because
+    infer_dtype judges it on values it does not have.
+    """
+    profile = category_profile(pd.Series([None, None], dtype=text_dtype))
+    assert not profile["as_category"]
+    assert profile["rejected_by"] in {"empty", "not text"}
+
+
+def test_category_profile_reports_the_measured_saving():
+    """A number to overrule the default with, not just a yes or no."""
+    s = pd.Series(["a", "b"] * 20_000, dtype=object)
+    profile = category_profile(s)
+    assert profile["bytes_after"] < profile["bytes_before"]
+    assert profile["saving"] == round(profile["bytes_before"] / profile["bytes_after"], 1)
+
+
+# --- to_category ----------------------------------------------------------
+
+
+def test_to_category_converts_a_candidate():
+    """The verdict applied."""
+    s = pd.Series(["movie", "short"] * 1000, dtype=object)
+    assert isinstance(to_category(s).dtype, pd.CategoricalDtype)
+
+
+def test_to_category_leaves_a_non_candidate_alone():
+    """An identifier column comes back as it arrived."""
+    s = pd.Series([f"tt{i:08d}" for i in range(5000)], dtype=object)
+    assert_series_equal(to_category(s), s)
+
+
+def test_to_category_preserves_every_value():
+    """Converting is lossless — no value is dropped for being rare."""
+    values = ["common"] * 10_000 + ["rare"]
+    s = pd.Series(values, dtype=object)
+    assert to_category(s).tolist() == s.tolist()
+
+
+# --- the category fields on the record ------------------------------------
+
+
+def test_record_reports_the_category_verdict():
+    """clean_dataframe measures but does not convert."""
+    frame = pd.DataFrame({"kind": pd.Series(["movie", "short"] * 500, dtype=object)})
+    cleaned, record = clean_dataframe(frame)
+
+    assert record.set_index("column").loc["kind", "as_category"]
+    assert record.set_index("column").loc["kind", "n_categories"] == 2
+    # Reported, not applied.
+    assert not isinstance(cleaned["kind"].dtype, pd.CategoricalDtype)
+
+
+def test_clean_dataframe_categorize_opts_in():
+    """With categorize=True the approved columns are converted."""
+    frame = pd.DataFrame({"kind": pd.Series(["movie", "short"] * 500, dtype=object)})
+    cleaned, record = clean_dataframe(frame, categorize=True)
+
+    assert isinstance(cleaned["kind"].dtype, pd.CategoricalDtype)
+    assert record.set_index("column").loc["kind", "dtype_after"] == "category"
+
+
+def test_clean_dataframe_categorize_leaves_others_alone():
+    """Only the approved columns change."""
+    frame = pd.DataFrame(
+        {
+            "kind": pd.Series(["movie", "short"] * 500, dtype=object),
+            "tconst": pd.Series([f"tt{i:08d}" for i in range(1000)], dtype=object),
+        }
+    )
+    cleaned, _ = clean_dataframe(frame, categorize=True)
+    assert isinstance(cleaned["kind"].dtype, pd.CategoricalDtype)
+    assert not isinstance(cleaned["tconst"].dtype, pd.CategoricalDtype)
+
+
+# --- the Arrow NaN trap, across every backend -----------------------------
+#
+# These exist because the whole convertibility suite was written on
+# dtype=object and passed, while the same code found nothing at all on an
+# Arrow column. Under Arrow a failed coercion produces NaN, which is a valid
+# double distinct from null, so isna() reports it as PRESENT and every
+# failure is invisible. A column read with dtype_backend="pyarrow" reported
+# zero unconvertible values on data that had 32.
+#
+# Anything asking "which rows did this coercion lose" goes through
+# missing_mask, never isna().
+
+
+def test_missing_mask_agrees_with_missing_count(text_dtype):
+    """The mask and the count are the same answer at different shapes."""
+    s = pd.Series(["a", None, "c"], dtype=text_dtype)
+    assert missing_mask(s).sum() == missing_count(s)
+
+
+def test_missing_mask_catches_nan_from_a_failed_coercion(text_dtype):
+    """The failure mode itself, stated directly.
+
+    isna() is False for an Arrow NaN; missing_mask is not.
+    """
+    coerced = pd.to_numeric(pd.Series(["1", "2", "nope"], dtype=text_dtype), errors="coerce")
+    assert missing_mask(coerced).sum() == 1
+
+
+def test_convertibility_counts_failures_on_every_backend(text_dtype):
+    """The regression. Object-only tests let this through."""
+    s = pd.Series(["1", "2", "Talk-Show", "4"], dtype=text_dtype)
+    result = convertibility(s, target="numeric")
+    assert result["n_unconvertible"] == 1
+    assert result["values"] == {"Talk-Show": 1}
+
+
+def test_failed_values_finds_offenders_on_every_backend(text_dtype):
+    """Same trap, same fix, in the sentinel path."""
+    s = pd.Series(["1", "2", "unknown"], dtype=text_dtype)
+    assert failed_values(s, _to_numeric(s)) == ["unknown"]
+
+
+def test_discover_specials_works_on_every_backend(text_dtype):
+    """Sentinel discovery depends on the same mask."""
+    s = pd.Series(["1", "2", "unknown", "4", "REFUSED", "6"], dtype=text_dtype)
+    assert sorted(discover_specials(s)) == ["REFUSED", "unknown"]
+
+
+def test_find_unconvertible_finds_rows_on_every_backend(text_dtype):
+    """And the row-level view."""
+    frame = pd.DataFrame({"runtime": pd.Series(["90", "Talk-Show", "120"], dtype=text_dtype)})
+    assert find_unconvertible(frame, target="numeric")["value"].tolist() == ["Talk-Show"]
+
+
+def test_convertibility_counts_infinities_on_every_backend(text_dtype):
+    """to_numpy on an Arrow column has its own conversion rules."""
+    s = pd.Series(["1", "inf", "-inf"], dtype=text_dtype)
+    assert convertibility(s, target="numeric")["n_infinite"] == 2
+
+
+# --- the contamination verdict --------------------------------------------
+#
+# A column where every value fails a numeric coercion is not contaminated,
+# it is text. Reporting 100% unconvertible and twenty sample titles is true
+# and useless: it buries the one column that has 32 bad rows in it.
+
+
+def test_verdict_is_clean_when_nothing_fails():
+    """Nothing to report."""
+    result = convertibility(pd.Series(["1", "2", "3"], dtype=object))
+    assert result["verdict"] == "clean"
+    assert result["values"] == {}
+
+
+def test_verdict_is_contaminated_for_a_minority_of_failures():
+    """The case the whole check exists for."""
+    values = [str(i) for i in range(1000)] + ["Talk-Show"] * 5
+    result = convertibility(pd.Series(values, dtype=object))
+    assert result["verdict"] == "contaminated"
+    assert result["values"] == {"Talk-Show": 5}
+
+
+def test_verdict_is_text_when_almost_everything_fails():
+    """A title column is not a broken numeric column."""
+    s = pd.Series(["The Matrix", "Amelie", "Se7en"], dtype=object)
+    result = convertibility(s, target="numeric")
+    assert result["verdict"] == "text"
+    assert result["n_unconvertible"] == 0
+    assert result["values"] == {}
+
+
+def test_text_verdict_still_reports_the_placeholders():
+    """Suppressing the failures does not suppress everything.
+
+    How much of the column is a null token is worth knowing whatever kind of
+    column it turns out to be.
+    """
+    values = ["The Matrix", "Amelie"] * 10 + [r"\N"] * 5
+    result = convertibility(pd.Series(values, dtype=object), target="numeric")
+    assert result["verdict"] == "text"
+    assert result["n_placeholder"] == 5
+
+
+def test_max_pct_can_be_raised_to_see_the_raw_counts():
+    """The measurement is suppressed in the report, not lost."""
+    s = pd.Series(["The Matrix", "Amelie", "Se7en"], dtype=object)
+    result = convertibility(s, target="numeric", max_pct=100.0)
+    assert result["verdict"] == "contaminated"
+    assert result["n_unconvertible"] == 3
+
+
+def test_best_target_is_not_confused_by_the_text_verdict():
+    """Target selection reads the raw counts.
+
+    A zeroed "text" verdict would tie with a genuinely clean conversion, and
+    every text column would be reported as whichever target was tried first.
+    """
+    assert best_target(pd.Series(["2020-01-01", "2020-02-01"], dtype=object)) == "datetime"
+
+
+def test_record_carries_the_verdict():
+    """So the report can be filtered rather than eyeballed."""
+    frame = pd.DataFrame(
+        {
+            "runtime": pd.Series(["90", "Talk-Show"] + [str(i) for i in range(20)], dtype=object),
+            "title": pd.Series(["The Matrix", "Amelie"] * 11, dtype=object),
+        }
+    )
+    _, record = clean_dataframe(frame)
+    by_column = record.set_index("column")
+
+    assert by_column.loc["runtime", "unconvertible_verdict"] == "contaminated"
+    assert by_column.loc["title", "unconvertible_verdict"] == "text"
+    assert by_column.loc["title", "n_unconvertible"] == 0
+    assert by_column.loc["title", "unconvertible_values"] == {}
+
+
+def test_record_and_find_unconvertible_agree():
+    """One constant, so the two views cannot disagree about a column."""
+    frame = pd.DataFrame(
+        {
+            "runtime": pd.Series(["90", "Talk-Show"] + [str(i) for i in range(20)], dtype=object),
+            "title": pd.Series(["The Matrix", "Amelie"] * 11, dtype=object),
+        }
+    )
+    _, record = clean_dataframe(frame)
+    contaminated = set(record.loc[record["unconvertible_verdict"] == "contaminated", "column"])
+    assert contaminated == set(find_unconvertible(frame)["column"].unique())
+    assert CONTAMINATION_MAX_PCT == 50.0

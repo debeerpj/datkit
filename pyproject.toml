@@ -24,8 +24,10 @@ dev = [
     "ipykernel>=7.3.0",
     "psutil>=7.2.2",
     "pyarrow>=18.1.0",
+    "pycaret>=2.2.2",
     "pytest>=8.3.4",
     "ruff>=0.16.6",
+    "scikit-learn>=1.7.2",
 ]
 
 [tool.ruff]
